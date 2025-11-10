@@ -1,220 +1,184 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-OKX TÍN HIỆU MẠNH: HỢP LƯU EMA20/50 + MACD + RSI
-→ Trên cả M15 và H1 → Gửi tất cả tín hiệu
-→ Quét 100 cặp volume cao nhất
-"""
-
+import telegram
+import asyncio
 import requests
-import time
 from datetime import datetime
 
-# ============================= CONFIG =============================
+# ==================== CẤU HÌNH ====================
 TELEGRAM_TOKEN = '7928253501:AAGbYEC0NXQSXb39iE-CiLk16p9C43gje2s'
-CHAT_ID        = '5694180372'
-INTERVAL_SECONDS = 300   # 5 phút
-INST_TYPE = 'SWAP'
-TOP_N = 100              # Quét 100 cặp
-# =================================================================
+CHAT_ID = '5694180372'
 
-OKX_BASE_URL = 'https://www.okx.com'
-TELEGRAM_URL = f'https://api.telegram.org/bot{TELEGRAM_TOKEN}'
+SCAN_INTERVAL = 70  # quét mỗi 70 giây
+TOP_N = 30
+# ================================================
 
-def send(msg):
+bot = telegram.Bot(token=TELEGRAM_TOKEN)
+sent_signals = {}  # chống spam: {symbol: "BUY"/"SELL"}
+
+def get_top_30_by_volume():
+    """Lấy chính xác TOP 30 coin có VOLUME 24h lớn nhất"""
+    url = "https://www.okx.com/api/v5/market/tickers?instType=SWAP"
     try:
-        requests.post(f'{TELEGRAM_URL}/sendMessage', json={
-            'chat_id': CHAT_ID,
-            'text': msg,
-            'parse_mode': 'HTML',
-            'disable_web_page_preview': True
-        }, timeout=10)
+        response = requests.get(url, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+
+        if data.get('code') != '0':
+            print(f"API Error: {data.get('msg')}")
+            return []
+
+        coins = []
+        for item in data['data']:
+            inst_id = item.get('instId', '')
+            if not inst_id.endswith('-USDT-SWAP'):
+                continue
+
+            symbol = inst_id.replace('-USDT-SWAP', '')
+            volume_24h = float(item.get('volCcy24h', 0))  # Volume 24h tính bằng USDT
+
+            if volume_24h > 0:
+                coins.append({
+                    'symbol': symbol,
+                    'instId': inst_id,
+                    'volume': volume_24h,
+                    'trades': int(item.get('cnt24h', 0))
+                })
+
+        # Sắp xếp theo VOLUME 24h giảm dần → lấy TOP 30
+        top_30 = sorted(coins, key=lambda x: x['volume'], reverse=True)[:TOP_N]
+
+        print(f"ĐÃ TẢI TOP {TOP_N} COIN THEO VOLUME 24h:")
+        for i, c in enumerate(top_30[:10], 1):
+            print(f"  {i:2}. {c['symbol']:>8} → ${c['volume']:>15,.0f}")
+
+        return top_30
+
     except Exception as e:
-        print(f"Lỗi gửi Telegram: {e}")
-
-def get_tickers():
-    try:
-        r = requests.get(f'{OKX_BASE_URL}/api/v5/market/tickers?instType={INST_TYPE}', timeout=10)
-        data = r.json()
-        if data.get('code') == '0':
-            return data.get('data', [])
-    except Exception as e:
-        print(f"Lỗi lấy tickers: {e}")
-    return []
-
-def get_candles(inst_id, bar, limit=200):
-    try:
-        r = requests.get(f'{OKX_BASE_URL}/api/v5/market/candles', params={
-            'instId': inst_id, 'bar': bar, 'limit': limit
-        }, timeout=10)
-        data = r.json()
-        if data.get('code') == '0':
-            return data.get('data', [])
-    except:
+        print(f"Lỗi lấy TOP 30 volume: {e}")
         return []
-    return []
 
-# === EMA ===
-def ema(prices, period):
+
+def get_candles(inst_id, timeframe, limit=300):
+    url = "https://www.okx.com/api/v5/market/candles"
+    params = {'instId': inst_id, 'bar': timeframe, 'limit': str(limit)}
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        data = r.json()
+        return data['data'] if data.get('code') == '0' else None
+    except:
+        return None
+
+
+def ema(prices, period=200):
+    prices = [float(p) for p in prices[-period:]]
     if len(prices) < period:
-        return 0.0
+        return None
     k = 2 / (period + 1)
-    ema_val = sum(prices[:period]) / period
-    for p in prices[period:]:
-        ema_val = p * k + ema_val * (1 - k)
+    ema_val = prices[0]
+    for price in prices[1:]:
+        ema_val = price * k + ema_val * (1 - k)
     return round(ema_val, 8)
 
-# === RSI ===
-def rsi(prices, period=14):
-    if len(prices) < period + 1:
-        return 50.0
-    gains = [max(prices[i] - prices[i-1], 0) for i in range(1, len(prices))]
-    losses = [max(prices[i-1] - prices[i], 0) for i in range(1, len(prices))]
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return round(100 - (100 / (1 + rs)), 2)
 
-# === MACD ===
-def macd_signal(prices, fast=12, slow=26, signal=9):
-    if len(prices) < slow + signal:
-        return 0.0, 0.0
-    ema_fast = ema(prices, fast)
-    ema_slow = ema(prices, slow)
-    macd_line = ema_fast - ema_slow
-    macd_values = []
-    for i in range(slow, len(prices)):
-        f = ema(prices[:i+1], fast)
-        s = ema(prices[:i+1], slow)
-        macd_values.append(f - s)
-    if len(macd_values) < signal:
-        return 0.0, 0.0
-    signal_line = ema(macd_values[-signal:], signal)
-    return macd_line, signal_line
+async def send_signal(coin):
+    symbol = coin['symbol']
+    signal = coin['signal']
+    ema200 = coin['ema200']
+    volume = coin['volume']
 
-# === Phân tích 1 khung ===
-def analyze_frame(closes):
-    if len(closes) < 60:
-        return None
+    if sent_signals.get(symbol) == signal:
+        return  # không spam
 
-    # EMA 20 & 50
-    ema20_now = ema(closes, 20)
-    ema50_now = ema(closes, 50)
-    ema20_prev = ema(closes[:-1], 20)
-    ema50_prev = ema(closes[:-1], 50)
+    direction = "trên" if signal == "BUY" else "dưới"
+    emoji = "BUY" if signal == "BUY" else "SELL"
 
-    # MACD
-    macd_now, signal_now = macd_signal(closes, 12, 26, 9)
-    macd_prev, signal_prev = macd_signal(closes[:-1], 12, 26, 9)
+    msg = f"""
+TÍN HIỆU MỚI - TOP 30 VOLUME 24h
 
-    # RSI
-    current_rsi = rsi(closes)
+{symbol}-USDT Perpetual
+{emoji} **{signal}**
 
-    # Cắt EMA
-    ema_up = ema20_prev <= ema50_prev and ema20_now > ema50_now
-    ema_down = ema20_prev >= ema50_prev and ema20_now < ema50_now
+4 nến M5 đóng {direction} EMA200 (H1)
+EMA200 H1: `{ema200}`
+Volume 24h: `${volume:,.0f}` ← SIÊU KHỦNG!
 
-    # Cắt MACD
-    macd_up = macd_prev <= signal_prev and macd_now > signal_now
-    macd_down = macd_prev >= signal_prev and macd_now < signal_now
+Thời gian: {datetime.now().strftime('%H:%M:%S | %d/%m/%Y')}
 
-    if ema_up and macd_up and current_rsi > 50:
-        return {"signal": "BUY", "rsi": current_rsi}
-    if ema_down and macd_down and current_rsi < 50:
-        return {"signal": "SELL", "rsi": current_rsi}
-    return None
+Coin đang được ĐỔ TIỀN MẠNH NHẤT toàn sàn OKX!
+    """.strip()
 
-# === Phân tích cặp giao dịch ===
-def get_signal(inst_id):
-    # Lấy nến M15
-    klines_m15 = get_candles(inst_id, '15m', 200)
-    if len(klines_m15) < 60:
-        return None
-    klines_m15 = klines_m15[::-1]
-    closes_m15 = [float(k[4]) for k in klines_m15]
+    try:
+        await bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode='Markdown')
+        print(f"ĐÃ GỬI {signal} → {symbol} | Volume: ${volume:,.0f}")
+        sent_signals[symbol] = signal
+    except Exception as e:
+        print(f"Telegram lỗi: {e}")
 
-    # Lấy nến H1
-    klines_h1 = get_candles(inst_id, '1H', 200)
-    if len(klines_h1) < 60:
-        return None
-    klines_h1 = klines_h1[::-1]
-    closes_h1 = [float(k[4]) for k in klines_h1]
 
-    # Phân tích M15
-    result_m15 = analyze_frame(closes_m15)
-    if not result_m15:
-        return None
+async def check_coin(coin):
+    symbol = coin['symbol']
+    inst_id = coin['instId']
 
-    # Phân tích H1
-    result_h1 = analyze_frame(closes_h1)
-    if not result_h1:
-        return None
+    # === EMA200 từ H1 ===
+    h1 = get_candles(inst_id, '1H', 250)
+    if not h1 or len(h1) < 200:
+        return
+    closes_h1 = [float(c[4]) for c in reversed(h1[-200:])]
+    ema200 = ema(closes_h1, 200)
+    if not ema200:
+        return
 
-    # Hợp lưu 2 khung
-    if result_m15['signal'] == result_h1['signal']:
-        price = closes_h1[-1]
-        return {
-            "symbol": inst_id,
-            "signal": result_m15['signal'],
-            "price": price,
-            "rsi_m15": result_m15['rsi'],
-            "rsi_h1": result_h1['rsi']
-        }
-    return None
+    # === 4 nến M5 mới nhất ===
+    m5 = get_candles(inst_id, '5m', 10)
+    if not m5 or len(m5) < 4:
+        return
+    closes_m5 = [float(c[4]) for c in m5[:4]]
 
-def main():
-    print("Bot Hợp Lưu M15 + H1 (EMA+MACD+RSI) khởi động...")
-    send("<b>Bot Hợp Lưu M15 + H1 (EMA20/50 + MACD + RSI) đã khởi động!</b>")
+    all_above = all(c > ema200 for c in closes_m5)
+    all_below = all(c < ema200 for c in closes_m5)
+
+    if all_above or all_below:
+        coin.update({
+            'signal': "BUY" if all_above else "SELL",
+            'ema200': ema200
+        })
+        await send_signal(coin)
+    else:
+        if symbol in sent_signals:
+            del sent_signals[symbol]  # reset khi hết điều kiện
+
+
+async def scanner():
+    print(f"\n{'='*75}")
+    print(f"QUÉT TOP {TOP_N} COIN VOLUME 24h LỚN NHẤT TRÊN OKX")
+    print(f"Thời gian: {datetime.now().strftime('%H:%M:%S | %d/%m/%Y')}")
+    print(f"{'='*75}")
+
+    top_coins = get_top_30_by_volume()
+    if not top_coins:
+        print("Không lấy được dữ liệu TOP 30!")
+        return
+
+    await asyncio.gather(*[check_coin(c) for c in top_coins])
+
+    print(f"Hoàn thành quét {len(top_coins)} coin. Nghỉ {SCAN_INTERVAL}s...\n")
+
+
+async def main():
+    print("BOT TOP 30 VOLUME 24h + EMA200 ĐÃ KHỞI ĐỘNG!")
+    print("Chỉ báo coin được ĐỔ TIỀN NHIỀU NHẤT toàn sàn!")
+    print("Sẵn sàng bắt những cú pump KHỦNG!\n")
 
     while True:
         try:
-            tickers = get_tickers()
-            if not tickers:
-                send("Lỗi kết nối OKX.")
-                time.sleep(60)
-                continue
-
-            top100 = sorted(tickers, key=lambda x: float(x['volCcy24h']), reverse=True)[:TOP_N]
-            signals = []
-
-            print(f"Đang quét {len(top100)} cặp (M15 + H1)...")
-            for idx, t in enumerate(top100, 1):
-                inst_id = t['instId']
-                print(f"  [{idx}/100] {inst_id}", end="\r")
-                sig = get_signal(inst_id)
-                if sig:
-                    sig['vol'] = float(t['volCcy24h']) / 1_000_000
-                    signals.append(sig)
-                time.sleep(0.12)
-
-            signals = sorted(signals, key=lambda x: x['vol'], reverse=True)
-
-            if not signals:
-                send("<b>Hiện tại không có tín hiệu hợp lưu M15 + H1 nào.</b>")
-            else:
-                msg = f"<b>TÍN HIỆU HỢP LƯU M15 + H1 ({len(signals)} cặp)</b>\n\n"
-                for i, s in enumerate(signals, 1):
-                    icon = "BUY" if s['signal'] == "BUY" else "SELL"
-                    msg += f"<b>{i}. {s['symbol']}</b>\n"
-                    msg += f"   {icon} <code>{s['price']:.4f}</code>\n"
-                    msg += f"   RSI: <b>M15={s['rsi_m15']}</b> | <b>H1={s['rsi_h1']}</b>\n"
-                    msg += f"   Vol: <b>{s['vol']:.1f}M</b>\n\n"
-                send(msg.strip())
-
-            print(f"\nGửi {len(signals)} tín hiệu hợp lưu M15+H1")
-            time.sleep(INTERVAL_SECONDS)
-
+            await scanner()
+            await asyncio.sleep(SCAN_INTERVAL)
         except KeyboardInterrupt:
-            send("Bot đã dừng.")
-            print("\nBot dừng.")
+            print("\nBot đã dừng.")
             break
         except Exception as e:
-            print(f"Lỗi: {e}")
-            time.sleep(60)
+            print(f"Lỗi hệ thống: {e}")
+            await asyncio.sleep(30)
 
-if __name__ == '__main__':
-    send("Kiểm tra bot hợp lưu M15+H1...")
-    main()
+
+if __name__ == "__main__":
+    asyncio.run(main())
